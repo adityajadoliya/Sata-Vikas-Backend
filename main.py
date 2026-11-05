@@ -61,7 +61,34 @@ def _image_mime_type(file: UploadFile) -> str:
 
 
 def _read_and_validate_form(image_bytes: bytes, content_type: str, expected_form_type: str) -> tuple[dict, str, dict]:
-    extracted = run_vision_extractor(image_bytes, content_type) if expected_form_type == "A" else run_form_b_vision_extractor(image_bytes, content_type)
+    image_path = _save_form_photo(image_bytes, content_type)
+    try:
+        extracted = run_vision_extractor(image_bytes, content_type) if expected_form_type == "A" else run_form_b_vision_extractor(image_bytes, content_type)
+    except Exception as e:
+        print(f"[OCR Exception] Form {expected_form_type} extraction failed: {e}")
+        if expected_form_type == "A":
+            extracted = {
+                "form_type": "A",
+                "header": {
+                    "log_date": datetime.utcnow().strftime("%d/%m/%Y"),
+                    "shift": "A",
+                    "page_no": "A",
+                },
+                "production_grid": [],
+                "loss_entries": [],
+                "low_confidence_fields": ["ai_ocr_service_unavailable"]
+            }
+        else:
+            extracted = {
+                "form_type": "B",
+                "header": {},
+                "tool_records": [],
+                "pdi_inspections": [],
+                "records": [],
+                "details": {},
+                "low_confidence_fields": ["ai_ocr_service_unavailable"]
+            }
+
     detected_type = str(extracted.get("form_type") or "unknown").upper()
     detection = {"form_type": detected_type if detected_type in {"A", "B"} else "unknown", "is_readable": True, "reason": ""}
     if detection["form_type"] in {"A", "B"} and detection["form_type"] != expected_form_type:
@@ -69,7 +96,6 @@ def _read_and_validate_form(image_bytes: bytes, content_type: str, expected_form
         detected_name = f"Page {detection['form_type']}"
         raise HTTPException(status_code=422, detail=f"This upload appears to be {detected_name}, not {expected_name}. Please upload the matching form.")
 
-    image_path = _save_form_photo(image_bytes, content_type)
     return extracted, image_path, detection
 
 
@@ -191,6 +217,7 @@ def createUser(request: userSchema, db: Session = Depends(get_db), admin_user: U
         username=request.username,
         email=request.email,
         password=hashedPassword,
+        plain_password=request.password,
         role=request.role or "employee",
         designation=request.designation,
         department=request.department or "Production",
@@ -222,6 +249,7 @@ def list_users(db: Session = Depends(get_db), admin_user: User = Depends(get_cur
             "username": u.username,
             "fullName": u.full_name or u.username,
             "email": u.email,
+            "password": u.plain_password or "",
             "role": u.role,
             "designation": u.designation,
             "department": u.department,
@@ -250,6 +278,7 @@ def get_user_by_id(user_id: str, db: Session = Depends(get_db), current_user: Us
         "username": user.username,
         "fullName": user.full_name or user.username,
         "email": user.email,
+        "password": user.plain_password or "",
         "role": user.role,
         "designation": user.designation,
         "department": user.department,
@@ -272,8 +301,9 @@ def update_user(
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    if request.full_name is not None:
-        user.full_name = request.full_name
+    target_name = request.full_name or getattr(request, 'fullName', None)
+    if target_name is not None:
+        user.full_name = target_name
     if request.email is not None:
         user.email = request.email
     if request.role is not None:
@@ -286,6 +316,7 @@ def update_user(
         user.status = request.status
     if request.password:
         user.password = pwd_context.hash(request.password)
+        user.plain_password = request.password
 
     db.commit()
     db.refresh(user)
@@ -295,6 +326,7 @@ def update_user(
         "employee_id": user.employee_id,
         "username": user.username,
         "fullName": user.full_name,
+        "password": user.plain_password or "",
         "role": user.role,
         "status": user.status
     }
@@ -361,7 +393,17 @@ def saveFormA(
     currentUser: User = Depends(get_current_user)
 ):
     try:
+        unique_number = (request.form_unique_id or request.form_a_unique_number or "").strip()
+        if unique_number:
+            existing_log = db.query(ProductionLog).filter(ProductionLog.form_unique_id == unique_number).first()
+            if existing_log:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"This form has already been uploaded with Form No. '{unique_number}'. Please check your Form No. before uploading."
+                )
+
         parentLog = ProductionLog(
+            form_unique_id=unique_number if unique_number else None,
             logDate=request.log_date,
             shift=request.shift,
             opearationNumber=request.operation_number,
@@ -422,11 +464,22 @@ def saveFormA(
             "log_id": parentLog.id
         }
 
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
+        err_msg = str(e)
+        if "UNIQUE constraint failed" in err_msg or "unique constraint" in err_msg.lower():
+            if "form_unique_id" in err_msg.lower():
+                form_no_str = unique_number if (unique_number and unique_number.strip()) else "this"
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"This form has already been uploaded with Form No. '{form_no_str}'. Please check your Form No. before uploading."
+                )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save Form A: {str(e)}"
+            detail=f"Failed to save Form A: {err_msg}"
         )
 
 
@@ -463,6 +516,9 @@ def get_form_a_list(
         for item in logs:
             result_list.append({
                 "id": item.id,
+                "form_unique_id": item.form_unique_id,
+                "form_a_unique_number": item.form_unique_id,
+                "serialNo": item.form_unique_id,
                 "logDate": item.logDate,
                 "shift": item.shift,
                 "machineNo": item.machineNo,
@@ -521,6 +577,9 @@ def get_form_a_by_id(id: int, db: Session = Depends(get_db), current_user: User 
 
     return {
         "id": item.id,
+        "form_unique_id": item.form_unique_id,
+        "form_a_unique_number": item.form_unique_id,
+        "serialNo": item.form_unique_id,
         "logDate": item.logDate,
         "shift": item.shift,
         "machineNo": item.machineNo,
@@ -556,6 +615,18 @@ def update_form_a_by_id(
         raise HTTPException(status_code=403, detail="You can only edit your own Form A records")
 
     try:
+        unique_number = (request.form_unique_id or request.form_a_unique_number or "").strip()
+        if unique_number:
+            existing_log = db.query(ProductionLog).filter(
+                ProductionLog.form_unique_id == unique_number,
+                ProductionLog.id != id
+            ).first()
+            if existing_log:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"This form has already been uploaded with Form No. '{unique_number}'. Please check your Form No. before uploading."
+                )
+            item.form_unique_id = unique_number
         item.logDate = request.log_date
         item.shift = request.shift
         item.opearationNumber = request.operation_number
@@ -601,9 +672,20 @@ def update_form_a_by_id(
         db.commit()
         db.refresh(item)
         return get_form_a_by_id(id, db, current_user)
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to update Form A: {str(e)}")
+        err_msg = str(e)
+        if "UNIQUE constraint failed" in err_msg or "unique constraint" in err_msg.lower():
+            if "form_unique_id" in err_msg.lower():
+                form_no_str = unique_number if (unique_number and unique_number.strip()) else "this"
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"This form has already been uploaded with Form No. '{form_no_str}'. Please check your Form No. before uploading."
+                )
+        raise HTTPException(status_code=500, detail=f"Failed to update Form A: {err_msg}")
 
 
 # ─── 4. FORM B (PAGE B) - FOP & SHIFT HANDOVER (PDF SPEC) ─────

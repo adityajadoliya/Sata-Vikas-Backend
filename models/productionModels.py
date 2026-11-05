@@ -9,6 +9,7 @@ class ProductionLog(Base):
     __tablename__ = "ProductionLog"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    form_unique_id = Column(String(100), unique=True, index=True, nullable=True)
     logDate = Column(String(50), nullable=True)
     shift = Column(String(10), nullable=True)
     opearationNumber = Column(String(50), nullable=True)

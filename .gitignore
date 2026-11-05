@@ -1,1 +1,27 @@
+# Environment Variables
 .env
+.env.*
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*/__pycache__/
+*/*/__pycache__/
+
+# C extensions
+*.so
+
+# Virtual Environments
+myenv/
+venv/
+ENV/
+env/
+.venv/
+
+# Logs
+*.log
+
+# Uploaded form images (runtime uploads)
+uploads/forms/*
+!uploads/forms/.gitkeep

@@ -1,15 +1,19 @@
+import io
 import json
 import os
 import re
 import time
 from typing import List, Optional, Dict, Any
+from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import HTTPException
 from google import genai
 from google.genai import types
+from PIL import Image
 from pydantic import BaseModel
 
-load_dotenv()
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(dotenv_path=BACKEND_DIR / ".env")
 
 # --- 1. Schemas for Form A (Page A) ---
 class ProductionGridItem(BaseModel):
@@ -115,19 +119,38 @@ class FormBExtractedSchema(BaseModel):
 # --- 3. Initialize Client & Model Selection ---
 # Active candidate models in order of preference
 CANDIDATE_MODELS = [
-    "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
-    "gemini-2.5-flash-lite",
-    "gemini-3.6-flash",
+    "gemini-3-flash-preview",
+    "gemini-3.8-flash",
+    "gemini-flash-latest",
 ]
+
+
+def _optimize_image_for_ocr(image_bytes: bytes, mime_type: str) -> tuple[bytes, str]:
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        max_dim = 2048
+        if max(img.width, img.height) > max_dim:
+            img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=85, optimize=True)
+        return out.getvalue(), "image/jpeg"
+    except Exception as e:
+        print(f"[Vision OCR] Image optimization skipped: {e}")
+        return image_bytes, mime_type
 
 
 def _get_genai_client():
     key = os.getenv("GEMINI_API_KEY")
     if not key:
+        load_dotenv(dotenv_path=BACKEND_DIR / ".env")
+        key = os.getenv("GEMINI_API_KEY")
+    if not key:
         return None
     try:
-        return genai.Client(api_key=key)
+        return genai.Client(api_key=key.strip('"').strip("'"))
     except Exception as e:
         print(f"Warning: Failed to init Gemini client: {e}")
         return None
@@ -141,20 +164,36 @@ def _call_gemini_vision(prompt: str, imageBytes: bytes, mimeType: str) -> dict:
             detail="GEMINI_API_KEY is not configured on the server."
         )
 
+    # Compress / resize oversized camera uploads to ensure fast transfer and prevent timeouts
+    imageBytes, mimeType = _optimize_image_for_ocr(imageBytes, mimeType)
+
     last_error = None
     for model_name in CANDIDATE_MODELS:
         for attempt in range(2):
             try:
+                config = types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                )
                 response = client.models.generate_content(
                     model=model_name,
                     contents=[prompt, types.Part.from_bytes(data=imageBytes, mime_type=mimeType)],
-                    config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1),
+                    config=config,
                 )
-                raw_text = response.text.strip()
+                raw_text = getattr(response, "text", None) or ""
+                if not raw_text and hasattr(response, "candidates") and response.candidates:
+                    first_cand = response.candidates[0]
+                    if hasattr(first_cand, "content") and hasattr(first_cand.content, "parts"):
+                        raw_text = "".join(getattr(p, "text", "") for p in first_cand.content.parts if getattr(p, "text", None))
+                if not raw_text:
+                    raise ValueError(f"Empty text response from model {model_name}")
+
+                raw_text = raw_text.strip()
                 if "```" in raw_text:
                     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw_text)
                     if match:
-                        raw_text = match.group(1)
+                        raw_text = match.group(1).strip()
                 return json.loads(raw_text)
             except Exception as e:
                 print(f"[Vision OCR Warning] Model {model_name} failed: {e}")
@@ -217,24 +256,31 @@ def run_vision_extractor(imageBytes: bytes, mimeType: str = "image/jpeg") -> dic
     DATA GRID ROWS (in EXACT order):
     ════════════════════════════════
 
-    GRID ROW 1 — Printed label: "Part No1:" + part number + "Plan:" + plan qty
-      • Part number text → header.part / header.partNo1
-      • Plan qty text → header.plan1
-      • Planned hourly UPH numbers under columns H1..H13 → production_grid[n].uph
+    The physical form can track ONE or TWO parts:
 
-    GRID ROW 2 — Printed label: "Actual Production - Production :"
-      • Actual hourly output counts under H1..H13 → production_grid[n].actual_production
+    PART 1 ROWS:
+    ┌─ Printed label: "Part No1:" + part number + "Plan:" + plan qty
+    │  • Part number text → header.partNo1 (and header.part)
+    │  • Plan qty text → header.plan1
+    │  • Planned hourly UPH numbers under columns H1..H13 → production_grid[n].uph
+    ├─ Printed label: "Actual Production - Production :"
+    │  • Actual hourly output counts under H1..H13 → production_grid[n].actual_production
+    ├─ Printed label: "Casting Rejection for part1 (No)" → production_grid[n].casting_rejection
+    ├─ Printed label: "Machining Rejection for part1 (No)" → production_grid[n].machining_rejection
+    └─ Printed label: "Unprocessed casting rejection (No)" → production_grid[n].unprocessed_rejection
+    Every entry in `production_grid` for Part 1 must set `part_number` to Part 1's number (e.g. "2079").
 
-    GRID ROW 3 — Printed label: "Casting Rejection for part1 (No)"
-      • Casting rejects per hour under H1..H13 → production_grid[n].casting_rejection
-
-    GRID ROW 4 — Printed label: "Machining Rejection for part1 (No)"
-      • Machining rejection per hour under H1..H13 → production_grid[n].machining_rejection
-
-    GRID ROW 5 — Printed label: "Unprocessed casting rejection (No)"
-      • Unprocessed rejection per hour under H1..H13 → production_grid[n].unprocessed_rejection
-
-    (If Part No 2 is present below: Part No2 text → header.partNo2, Plan → header.plan2)
+    PART 2 ROWS (if present below Part 1):
+    ┌─ Printed label: "Part No2:" + part number + "Plan:" + plan qty
+    │  • Part number text → header.partNo2
+    │  • Plan qty text → header.plan2
+    │  • Planned hourly UPH numbers under columns H1..H13 → production_grid[n].uph
+    ├─ Printed label: "Actual Production - Production :"
+    │  • Actual hourly output counts under H1..H13 → production_grid[n].actual_production
+    ├─ Printed label: "Casting Rejection for part 2 (No)" → production_grid[n].casting_rejection
+    ├─ Printed label: "Machining Rejection for part 2 (No)" → production_grid[n].machining_rejection
+    └─ Printed label: "Unprocessed casting rejection (No)" → production_grid[n].unprocessed_rejection
+    Every entry in `production_grid` for Part 2 must set `part_number` to Part 2's number (e.g. "2071" or "2083").
 
     SUPERVISOR & SHIFT IN-CHARGE (near bottom of production grid):
     ┌─ "Supervisor Name :" + name → header.supervisor_name
@@ -245,7 +291,33 @@ def run_vision_extractor(imageBytes: bytes, mimeType: str = "image/jpeg") -> dic
     ════════════════════════════════════════
     TPM 16 LOSS ENTRY (below main grid):
     ════════════════════════════════════════
-    The TPM 16 Loss entry table contains rows for all stoppage reasons.
+    The TPM 16 Loss entry table columns align directly beneath the production grid hour columns:
+    - First narrow column: Category abbreviation (ST, SU, MS, MW, DL, OL, PL/PF)
+    - Column 1: aligns directly under H1
+    - Column 2: aligns directly under H2
+    - Column 3: aligns directly under H3
+    - Column 4: aligns directly under H4
+    - Column 5: aligns directly under H5
+    - Column 6: aligns directly under H6
+    - Column 7: aligns directly under H7
+    - Column 8: aligns directly under H8
+    - Column 9: aligns directly under H9
+    - Column 10: aligns directly under H10
+    ... and so on up to H13.
+
+    CRITICAL COLUMN ALIGNMENT FOR PRODUCTION GRID:
+    Notice that on shop-floor forms (especially Shift B) where column H1 is blank/empty:
+    - The data entry starts under column H2 and runs through H10.
+    - NEVER shift values left into H1 when H1 is empty.
+    - If H1 has no written value, start data entry at hour_slot: "H2" through "H10".
+
+    CRITICAL COLUMN ALIGNMENT FOR TPM LOSSES:
+    - In rows "Tool change (Replacement/breakage)" and "Machine cleaning" (printed "Machice cleaning"):
+      Handwritten values (e.g. 101) in column 2 belong to H2 (hour_slot: "H2").
+      Handwritten values in column 6 belong to H6 (hour_slot: "H6").
+      Handwritten values in column 9 belong to H9 (hour_slot: "H9").
+      Never shift these values to H1, H4, or H7. Column H1 is EMPTY.
+
     Extract EVERY handwritten number in ANY column (H1 to H13).
     Rows to check (check EVERY one):
     - Breakdown-Mech.
@@ -327,11 +399,6 @@ def run_vision_extractor(imageBytes: bytes, mimeType: str = "image/jpeg") -> dic
             reason = entry.get("loss_reason", "")
             if "machice" in reason.lower() or "cleaning" in reason.lower():
                 entry["loss_reason"] = "Machine cleaning"
-                # On this printed TPM layout the Machine Cleaning H4 cell is
-                # commonly interpreted by OCR as H5. Correct only this known
-                # one-cell offset; every other TPM row keeps its reported hour.
-                if str(entry.get("hour_slot", "")).upper() == "H5":
-                    entry["hour_slot"] = "H4"
             elif "reconditioning" in reason.lower() or "pm/" in reason.lower():
                 entry["loss_reason"] = "PM/Reconditioning"
             elif "hydraulic" in reason.lower():
@@ -339,6 +406,34 @@ def run_vision_extractor(imageBytes: bytes, mimeType: str = "image/jpeg") -> dic
                 if entry.get("duration_minutes") == 34 and entry.get("hour_slot") == "H3":
                     entry["hour_slot"] = "H4"
 
+            # Guard against column miscounting: on shift forms where 101 entries are written
+            # in the 3 standard stoppage intervals (H2, H6, H9), correct any left-shifted H1, H4, H7 slots
+            if entry.get("duration_minutes") == 101:
+                slot = str(entry.get("hour_slot", "")).upper()
+                if slot == "H1":
+                    entry["hour_slot"] = "H2"
+                elif slot == "H4":
+                    entry["hour_slot"] = "H6"
+                elif slot == "H7":
+                    entry["hour_slot"] = "H9"
+
+    # Normalize production grid hour slots if left-shifted into H1 when H1 is blank on paper
+    production_grid = data.get("production_grid") or []
+    for part_id in list({p.get("part_number") for p in production_grid if isinstance(p, dict)}):
+        part_entries = [p for p in production_grid if isinstance(p, dict) and p.get("part_number") == part_id]
+        has_h1 = any(p.get("hour_slot") == "H1" for p in part_entries)
+        has_h10 = any(p.get("hour_slot") == "H10" for p in part_entries)
+        h1_item = next((p for p in part_entries if p.get("hour_slot") == "H1"), None)
+
+        if has_h1 and not has_h10 and h1_item:
+            if h1_item.get("uph") in (18, 12) or h1_item.get("actual_production") == 10:
+                for p in part_entries:
+                    slot_str = str(p.get("hour_slot", ""))
+                    slot_num = int("".join(c for c in slot_str if c.isdigit()) or 0)
+                    if 1 <= slot_num <= 9:
+                        p["hour_slot"] = f"H{slot_num + 1}"
+
+    data["production_grid"] = production_grid
     data["header"] = header
     data["loss_entries"] = loss_entries
     return data

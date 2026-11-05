@@ -44,6 +44,7 @@ def create_initial_admin():
             username=admin_username,
             email=admin_email,
             password=hashed_password,
+            plain_password=plain_password,
             role="admin",
             designation="Super Admin",
             department="IT",
@@ -72,4 +73,4 @@ def create_initial_admin():
         db.close()
 
 if __name__ == "__main__":
-    create_initial_admin()
+    create_initial_admin()

@@ -16,10 +16,11 @@ class userSchema(BaseModel):
 
 class UserUpdateSchema(BaseModel):
     full_name: Optional[str] = None
+    fullName: Optional[str] = None
     username: Optional[str] = None
     email: Optional[str] = None
     password: Optional[str] = None
     role: Optional[str] = None
     designation: Optional[str] = None
     department: Optional[str] = None
-    status: Optional[str] = None
+    status: Optional[str] = None

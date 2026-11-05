@@ -14,6 +14,7 @@ class User(Base):
     username = Column(String, unique=True, nullable=False, index=True)
     email = Column(String, unique=True, nullable=False, index=True)
     password = Column(String, nullable=False)
+    plain_password = Column(String, nullable=True)
     
     role = Column(String, nullable=False, default="employee")  # "admin" / "employee"
     designation = Column(String, nullable=True)

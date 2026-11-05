@@ -20,6 +20,8 @@ class TPMLossSchema(BaseModel):
 
 # 3. Main Form A Payload Schema (Extraction response ke sath exact match)
 class FormASaveSchema(BaseModel):
+    form_unique_id: Optional[str] = None
+    form_a_unique_number: Optional[str] = None
     log_date: Optional[str] = None
     shift: Optional[str] = None
     qa_cell: Optional[str] = None
